@@ -1,0 +1,19 @@
+import type { Trade } from "./journal";
+
+export type CloudSession={access_token:string;refresh_token:string;expires_at?:number;user:{id:string;email?:string}};
+const url=process.env.NEXT_PUBLIC_SUPABASE_URL?.replace(/\/$/,"");
+const key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+export const cloudConfigured=Boolean(url&&key);
+const SESSION_KEY="pipfolio-auth-session";
+export function readSession():CloudSession|null{if(typeof window==="undefined")return null;try{return JSON.parse(localStorage.getItem(SESSION_KEY)||"null") as CloudSession|null}catch{return null}}
+function saveSession(s:CloudSession|null){if(typeof window==="undefined")return;if(s)localStorage.setItem(SESSION_KEY,JSON.stringify(s));else localStorage.removeItem(SESSION_KEY)}
+async function authRequest(path:string,body:Record<string,string>){const r=await fetch(`${url}/auth/v1/${path}`,{method:"POST",headers:{"Content-Type":"application/json",apikey:key!},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw new Error(data.msg||data.message||data.error_description||data.error||"Authentication failed");return data}
+export async function signIn(email:string,password:string){const d=await authRequest("token?grant_type=password",{email,password});const s:CloudSession={access_token:d.access_token,refresh_token:d.refresh_token,expires_at:d.expires_at,user:d.user};saveSession(s);return s}
+export async function signUp(email:string,password:string){const d=await authRequest("signup",{email,password});if(d.access_token){const s:CloudSession={access_token:d.access_token,refresh_token:d.refresh_token,expires_at:d.expires_at,user:d.user};saveSession(s);return s}return null}
+export async function signOut(){const s=readSession();if(s)await fetch(`${url}/auth/v1/logout`,{method:"POST",headers:{apikey:key!,Authorization:`Bearer ${s.access_token}`}}).catch(()=>{});saveSession(null)}
+async function refresh(s:CloudSession):Promise<CloudSession>{const d=await authRequest("token?grant_type=refresh_token",{refresh_token:s.refresh_token});const n:CloudSession={access_token:d.access_token,refresh_token:d.refresh_token,expires_at:d.expires_at,user:d.user};saveSession(n);return n}
+async function request(path:string,init:RequestInit={},session=readSession()):Promise<Response>{if(!url||!key||!session)throw new Error("Cloud account is not configured or signed in.");let active=session;const make=()=>fetch(`${url}/rest/v1/${path}`,{...init,headers:{apikey:key!,Authorization:`Bearer ${active.access_token}`,"Content-Type":"application/json",...(init.headers||{})}});let res=await make();if(res.status===401){active=await refresh(active);res=await make()}if(!res.ok){const d=await res.json().catch(()=>({}));throw new Error(d.message||d.hint||`Cloud request failed (${res.status})`)}return res}
+export async function loadTrades(session?:CloudSession):Promise<Trade[]>{const r=await request("trades?select=id,data&order=updated_at.asc",{},session);const rows=await r.json() as {id:string;data:Trade}[];return rows.map(x=>x.data)}
+export async function saveTrades(trades:Trade[],session?:CloudSession){if(!trades.length)return;const active=session||readSession();if(!active)throw new Error("Sign in to sync your journal.");const rows=trades.map(t=>({id:t.id,user_id:active.user.id,data:t,updated_at:new Date().toISOString()}));await request("trades?on_conflict=user_id%2Cid",{method:"POST",headers:{Prefer:"resolution=merge-duplicates,return=minimal"},body:JSON.stringify(rows)},active)}
+export async function removeTrade(id:string,session?:CloudSession){await request(`trades?id=eq.${encodeURIComponent(id)}`,{method:"DELETE"},session)}
+export async function replaceTrades(trades:Trade[],session?:CloudSession){const active=session||readSession();if(!active)throw new Error("Sign in to sync your journal.");await request(`trades?user_id=eq.${encodeURIComponent(active.user.id)}`,{method:"DELETE"},active);await saveTrades(trades,active)}
